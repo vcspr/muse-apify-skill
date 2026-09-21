@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Apify API CLI.
+
+Auth: set the APIFY_TOKEN environment variable to your Apify API token
+(Apify Console -> Settings -> Integrations). The token is sent only to
+https://api.apify.com and is never printed, logged, or written to disk.
+
+Subcommands:
+  me                    read-only identity check (GET /v2/users/me)
+                        Prints only safe identity fields (id, username).
+  actors                list your actors (GET /v2/acts)
+  run <actor-id>        start an actor run (POST /v2/acts/{id}/runs)
+  run-status <run-id>   check a run's state (GET /v2/actor-runs/{id})
+  dataset <dataset-id>  fetch dataset items (GET /v2/datasets/{id}/items)
+
+Credit-consuming: starting a run costs Apify credits. Never start one
+without the user's explicit approval in chat for that specific run.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+HOST = "api.apify.com"
+BASE = f"https://{HOST}/v2"
+
+
+def get_token() -> str:
+    token = os.environ.get("APIFY_TOKEN", "").strip()
+    if not token:
+        print(
+            "APIFY_TOKEN is not set.\n"
+            "Get a token from the Apify Console (Settings -> Integrations), then:\n"
+            "  export APIFY_TOKEN='your-token-here'",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return token
+
+
+def call(method: str, path: str, data=None) -> dict:
+    body = json.dumps(data).encode("utf-8") if data is not None else None
+    req = urllib.request.Request(BASE + path, data=body, method=method)
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", f"Bearer {get_token()}")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:800]
+        except Exception:  # noqa: BLE001
+            detail = "<unreadable body>"
+        print(f"HTTP {exc.code} on {method} {path}: {detail}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_me(_args):
+    """Identity check. Only safe fields are printed; the raw response may
+    contain sensitive fields (e.g. proxy credentials), so it is never dumped."""
+    data = call("GET", "/users/me").get("data", {})
+    safe = {
+        "id": data.get("id"),
+        "username": data.get("username"),
+    }
+    print(json.dumps(safe, indent=2))
+
+
+def cmd_actors(args):
+    print(json.dumps(call("GET", f"/acts?limit={args.limit}&offset={args.offset}"), indent=2))
+
+
+def cmd_run(args):
+    payload = {}
+    if args.input:
+        payload = json.loads(args.input)
+    elif args.input_file:
+        with open(args.input_file, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    query = []
+    if args.memory:
+        query.append(f"memory={args.memory}")
+    if args.timeout:
+        query.append(f"timeout={args.timeout}")
+    path = f"/acts/{args.actor_id}/runs" + ("?" + "&".join(query) if query else "")
+    run = call("POST", path, payload)
+    print(json.dumps(run, indent=2))
+    data = run.get("data", {})
+    print(
+        f"\nrun {data.get('id')} status={data.get('status')} "
+        f"dataset={data.get('defaultDatasetId')}",
+        file=sys.stderr,
+    )
+
+
+def cmd_run_status(args):
+    if args.wait:
+        deadline = time.time() + args.wait
+        while True:
+            run = call("GET", f"/actor-runs/{args.run_id}")
+            status = run.get("data", {}).get("status")
+            if status in ("SUCCEEDED", "FAILED", "TIMED-OUT", "ABORTED"):
+                print(json.dumps(run, indent=2))
+                return
+            if time.time() > deadline:
+                print(json.dumps({"status": status, "note": "wait timed out"}, indent=2))
+                return
+            time.sleep(5)
+    print(json.dumps(call("GET", f"/actor-runs/{args.run_id}"), indent=2))
+
+
+def cmd_dataset(args):
+    path = (
+        f"/datasets/{args.dataset_id}/items"
+        f"?limit={args.limit}&offset={args.offset}&format=json&clean=true"
+    )
+    print(json.dumps(call("GET", path), indent=2))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Apify API CLI")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("me", help="read-only identity check")
+
+    p_actors = sub.add_parser("actors", help="list your actors")
+    p_actors.add_argument("--limit", type=int, default=50)
+    p_actors.add_argument("--offset", type=int, default=0)
+
+    p_run = sub.add_parser("run", help="start an actor run (costs credits)")
+    p_run.add_argument("actor_id", help="actor id, or username~name")
+    p_run.add_argument("--input", help="run input as a JSON string")
+    p_run.add_argument("--input-file", help="path to a JSON file with run input")
+    p_run.add_argument("--memory", type=int, help="memory in MB")
+    p_run.add_argument("--timeout", type=int, help="timeout in seconds")
+
+    p_status = sub.add_parser("run-status", help="check a run's state")
+    p_status.add_argument("run_id")
+    p_status.add_argument("--wait", type=int, default=0,
+                          help="seconds to poll until terminal state")
+
+    p_ds = sub.add_parser("dataset", help="fetch dataset items")
+    p_ds.add_argument("dataset_id")
+    p_ds.add_argument("--limit", type=int, default=50)
+    p_ds.add_argument("--offset", type=int, default=0)
+
+    args = parser.parse_args()
+    {"me": cmd_me, "actors": cmd_actors, "run": cmd_run,
+     "run-status": cmd_run_status, "dataset": cmd_dataset}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()
